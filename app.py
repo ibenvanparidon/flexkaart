@@ -383,14 +383,19 @@ with tab1:
         col_map, col_side = st.columns([2, 1])
 
         with col_map:
-            size_col = "gem_required_mw" if "gem_required_mw" in map_df.columns else None
             color_col = "organisation" if "organisation" in map_df.columns else None
             hover_data = ["datum", "state", "problem_area"] if "problem_area" in map_df.columns else []
+
+            # Prepareer size kolom: vul NaN met 0 en zorg voor positieve waarden
+            use_size = None
+            if "gem_required_mw" in map_df.columns and map_df["gem_required_mw"].notna().any():
+                map_df["_size"] = map_df["gem_required_mw"].fillna(0).clip(lower=0.1)
+                use_size = "_size"
 
             fig_map = px.scatter_map(
                 map_df,
                 lat="lat", lon="lon",
-                size=size_col if size_col and map_df[size_col].notna().any() else None,
+                size=use_size,
                 color=color_col,
                 color_discrete_map=NETBEHEERDER_COLORS if color_col else None,
                 hover_data=[c for c in hover_data if c in map_df.columns],
