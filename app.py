@@ -1,541 +1,849 @@
 """
-Flexkaart - GOPACS Marktberichten Dashboard
-Analyseert congestiemanagement in het Nederlandse elektriciteitsnet,
-verrijkt met Open-Meteo weerdata en CBS/PDOK-gebiedsinformatie.
+Flexkaart — Professioneel GOPACS Congestiemanagement Dashboard
+Multi-source marktdata met 4 strategische tabs.
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import sqlite3
 import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
-from pathlib import Path
+import sqlite3
 import tempfile
 import os
+import json
+from pathlib import Path
+from datetime import datetime, timedelta
 
-from data_import import import_excel_to_db, create_database, parse_mw_profile
-from api_clients import fetch_weather, cache_weather_to_db
-
-# Configuratie
+# ── Config ───────────────────────────────────────────
 st.set_page_config(
-    page_title="Flexkaart - GOPACS Dashboard",
+    page_title="Flexkaart — GOPACS Dashboard",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# Op Streamlit Cloud is de app-directory read-only; gebruik /tmp/ voor de database.
+DB_PATH = os.path.join(tempfile.gettempdir(), "flexkaart.db")
 _APP_DIR = Path(__file__).resolve().parent
 EXCEL_PATH = str(_APP_DIR / "GOPACS_Marktberichten.xlsx")
-DB_PATH = os.path.join(tempfile.gettempdir(), "flexkaart.db")
 
+# Kleurenpalet
 COLORS = {
-    "primary": "#1B4F72", "secondary": "#2E86C1", "accent": "#F39C12",
-    "success": "#27AE60", "danger": "#E74C3C",
-    "enexis": "#F39C12", "liander": "#2E86C1", "stedin": "#27AE60",
-    "tennet": "#8E44AD", "alliander": "#E74C3C",
+    "primary": "#1B4F72",
+    "secondary": "#2E86C1",
+    "accent": "#F39C12",
+    "success": "#27AE60",
+    "danger": "#E74C3C",
+    "bg": "#F8F9FA",
+    "grid": "#ECF0F1",
 }
 
-NETBEHEERDER_KLEUREN = {
-    "Enexis": COLORS["enexis"], "Liander": COLORS["liander"],
-    "Stedin": COLORS["stedin"], "TenneT": COLORS["tennet"],
-    "Alliander": COLORS["alliander"],
+NETBEHEERDER_COLORS = {
+    "TenneT": "#003366",
+    "Stedin": "#E87722",
+    "Liander": "#009B3A",
+    "Enexis": "#0072CE",
+    "Westland Infra": "#8B4513",
+    "Coteq Netbeheer": "#6A0DAD",
+    "Enduris": "#C0392B",
+    "Rendo": "#16A085",
 }
 
 
-# Data laden & caching
+# ── Data ophalen & caching ───────────────────────────
 
-@st.cache_data(ttl=3600)
-def load_marktberichten():
-    if not Path(DB_PATH).exists():
-        with st.spinner("Database wordt aangemaakt vanuit Excel..."):
-            import_excel_to_db(EXCEL_PATH, DB_PATH)
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql("SELECT * FROM marktberichten", conn)
-    conn.close()
-    date_cols = [
-        "datum_aangemaakt", "datum_laatste_update", "dag",
-        "periode_start", "periode_einde", "bieding_start", "bieding_einde"
-    ]
-    for col in date_cols:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-    df["datum"] = pd.to_datetime(df["datum"], errors="coerce")
-    return df
-
-
-@st.cache_data(ttl=3600)
-def load_weerdata(start_date, end_date):
+def _ensure_db():
+    """Zorg dat de database bestaat en gevuld is."""
+    from data_fetcher import init_db, fetch_all
+    if not os.path.exists(DB_PATH):
+        init_db(DB_PATH)
     conn = sqlite3.connect(DB_PATH)
     try:
-        cached = pd.read_sql("SELECT * FROM weerdata", conn)
-        if not cached.empty:
-            cached["datum"] = pd.to_datetime(cached["datum"], errors="coerce")
-            conn.close()
-            return cached
+        count = conn.execute("SELECT COUNT(*) FROM announcements").fetchone()[0]
     except Exception:
-        pass
+        count = 0
     conn.close()
-    cache_weather_to_db(DB_PATH, start_date, end_date)
+    if count == 0:
+        return True  # needs fetch
+    return False
+
+
+def _do_fetch():
+    """Voer een volledige data-fetch uit."""
+    from data_fetcher import fetch_all
+    progress = st.sidebar.progress(0, text="Data ophalen...")
+    status_text = st.sidebar.empty()
+
+    step_count = 5
+    current = [0]
+
+    def callback(msg):
+        current[0] += 1
+        progress.progress(min(current[0] / step_count, 1.0), text=msg)
+        status_text.text(msg)
+
+    results = fetch_all(DB_PATH, progress_callback=callback)
+    progress.progress(1.0, text="Klaar!")
+    return results
+
+
+def _also_import_excel():
+    """Importeer Excel data als marktberichten tabel (fallback/aanvulling)."""
+    if os.path.exists(EXCEL_PATH):
+        try:
+            from data_import import import_excel_to_db
+            import_excel_to_db(EXCEL_PATH, DB_PATH)
+            return True
+        except Exception:
+            pass
+    return False
+
+
+@st.cache_data(ttl=3600)
+def load_announcements():
     conn = sqlite3.connect(DB_PATH)
     try:
-        df = pd.read_sql("SELECT * FROM weerdata", conn)
-        df["datum"] = pd.to_datetime(df["datum"], errors="coerce")
+        df = pd.read_sql("SELECT * FROM announcements ORDER BY created_ts DESC", conn)
     except Exception:
         df = pd.DataFrame()
     conn.close()
     return df
 
 
-# Sidebar & Filters
+@st.cache_data(ttl=3600)
+def load_cleared_buckets():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql("SELECT * FROM cleared_buckets ORDER BY start_time DESC", conn)
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
 
-def render_sidebar(df):
-    st.sidebar.title("Flexkaart")
-    st.sidebar.caption("GOPACS Marktberichten Analyse")
-    st.sidebar.divider()
-    st.sidebar.subheader("Filters")
 
-    min_date = df["datum"].min()
-    max_date = df["datum"].max()
-    if pd.isna(min_date):
-        min_date = datetime(2020, 1, 1)
-    if pd.isna(max_date):
-        max_date = datetime.now()
+@st.cache_data(ttl=3600)
+def load_expenses():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql("SELECT * FROM expenses ORDER BY year, month", conn)
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
 
-    date_range = st.sidebar.date_input(
-        "Periode", value=(min_date, max_date),
-        min_value=min_date, max_value=max_date,
+
+@st.cache_data(ttl=3600)
+def load_performance():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql("SELECT * FROM performance ORDER BY year, month", conn)
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=3600)
+def load_weather():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql("SELECT * FROM weather ORDER BY datum", conn)
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=3600)
+def load_marktberichten():
+    """Laad de originele Excel-gebaseerde marktberichten (voor geodata tab)."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql("SELECT * FROM marktberichten", conn)
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
+
+
+@st.cache_data(ttl=3600)
+def load_fetch_log():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        df = pd.read_sql("SELECT * FROM fetch_log", conn)
+    except Exception:
+        df = pd.DataFrame()
+    conn.close()
+    return df
+
+
+# ── Helper functies ──────────────────────────────────
+
+def format_eur(val):
+    if pd.isna(val):
+        return "—"
+    return f"\u20ac {val:,.0f}"
+
+
+def format_mwh(val):
+    if pd.isna(val):
+        return "—"
+    return f"{val:,.1f} MWh"
+
+
+def plotly_layout(fig, title="", height=400):
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=16, color=COLORS["primary"])),
+        height=height,
+        margin=dict(l=40, r=20, t=50, b=40),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        font=dict(family="Inter, sans-serif", size=12),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.2, xanchor="center", x=0.5),
     )
-    netbeheerders = ["Alle"] + sorted(df["netbeheerder"].dropna().unique().tolist())
-    sel_netbeheerder = st.sidebar.multiselect("Netbeheerder", netbeheerders, default=["Alle"])
-    types = ["Alle"] + sorted(df["type"].dropna().unique().tolist())
-    sel_type = st.sidebar.selectbox("Type bericht", types)
-    statussen = ["Alle"] + sorted(df["status"].dropna().unique().tolist())
-    sel_status = st.sidebar.selectbox("Status", statussen)
-    provincies = ["Alle"] + sorted(df["provincie"].dropna().unique().tolist())
-    sel_provincie = st.sidebar.selectbox("Provincie", provincies)
+    fig.update_xaxes(gridcolor=COLORS["grid"], showgrid=True)
+    fig.update_yaxes(gridcolor=COLORS["grid"], showgrid=True)
+    return fig
 
-    st.sidebar.divider()
-    st.sidebar.markdown(
-        "**Data:** GOPACS Marktberichten  \n"
-        "**Weer:** Open-Meteo (gratis)  \n"
-        "**Geo:** PDOK / CBS Open Data"
-    )
-    return {
-        "date_range": date_range, "netbeheerder": sel_netbeheerder,
-        "type": sel_type, "status": sel_status, "provincie": sel_provincie,
+
+def parse_zip_codes(zip_json):
+    """Parse zip_codes JSON array naar lijst."""
+    if not zip_json or zip_json == "[]":
+        return []
+    try:
+        return json.loads(zip_json)
+    except Exception:
+        return []
+
+
+def zip_to_province(zip_code):
+    """Eenvoudige postcode -> provincie mapping."""
+    from data_import import postcode_to_provincie
+    return postcode_to_provincie(str(zip_code)) or "Onbekend"
+
+
+def zip_to_coords(zip_code):
+    """Postcode -> (lat, lon) mapping."""
+    from data_import import geocode_postcode
+    return geocode_postcode(str(zip_code))
+
+
+# ── Custom CSS ───────────────────────────────────────
+
+st.markdown("""
+<style>
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
     }
+    .stTabs [data-baseweb="tab"] {
+        padding: 10px 24px;
+        font-weight: 600;
+    }
+    .metric-card {
+        background: white;
+        border-radius: 12px;
+        padding: 20px;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+        border-left: 4px solid #2E86C1;
+    }
+    .metric-value {
+        font-size: 28px;
+        font-weight: 700;
+        color: #1B4F72;
+    }
+    .metric-label {
+        font-size: 13px;
+        color: #7F8C8D;
+        margin-top: 4px;
+    }
+    div[data-testid="stMetric"] {
+        background: white;
+        border-radius: 10px;
+        padding: 16px;
+        box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+    }
+</style>
+""", unsafe_allow_html=True)
 
 
-def apply_filters(df, filters):
-    filtered = df.copy()
-    dr = filters["date_range"]
-    if isinstance(dr, (list, tuple)) and len(dr) == 2:
-        start, end = pd.Timestamp(dr[0]), pd.Timestamp(dr[1])
-        filtered = filtered[(filtered["datum"] >= start) & (filtered["datum"] <= end)]
-    if "Alle" not in filters["netbeheerder"] and filters["netbeheerder"]:
-        filtered = filtered[filtered["netbeheerder"].isin(filters["netbeheerder"])]
-    if filters["type"] != "Alle":
-        filtered = filtered[filtered["type"] == filters["type"]]
-    if filters["status"] != "Alle":
-        filtered = filtered[filtered["status"] == filters["status"]]
-    if filters["provincie"] != "Alle":
-        filtered = filtered[filtered["provincie"] == filters["provincie"]]
-    return filtered
+# ── Sidebar ──────────────────────────────────────────
 
-
-# KPIs
-
-def render_kpis(df):
-    col1, col2, col3, col4, col5 = st.columns(5)
-    with col1:
-        st.metric("Totaal berichten", f"{len(df):,}")
-    with col2:
-        st.metric("Open", f"{len(df[df['status'] == 'Open']):,}")
-    with col3:
-        avg_mw = df["gem_vereist_mw"].mean()
-        st.metric("Gem. profiel (MW)", f"{avg_mw:.2f}" if pd.notna(avg_mw) else "-")
-    with col4:
-        st.metric("Unieke gebieden", f"{df['buy_orders_gebied'].nunique():,}")
-    with col5:
-        gem_duur = df["duur_uur"].mean()
-        st.metric("Gem. duur (uur)", f"{gem_duur:.1f}" if pd.notna(gem_duur) else "-")
-
-
-# Tab 1: Interactieve Kaart
-
-def render_kaart(df):
-    st.subheader("Congestiegebieden in Nederland")
-    map_df = df.dropna(subset=["lat", "lon"]).copy()
-    if map_df.empty:
-        st.warning("Geen geolocatie-data beschikbaar voor de huidige selectie.")
-        return
-
-    agg = (
-        map_df.groupby(["postcode_eerste", "lat", "lon", "provincie", "netbeheerder"])
-        .agg(aantal=("id", "count"), gem_mw=("gem_vereist_mw", "mean"),
-             max_mw=("max_vereist_mw", "max"), gem_duur=("duur_uur", "mean"))
-        .reset_index()
-    )
-    fig = px.scatter_map(
-        agg, lat="lat", lon="lon", size="aantal", color="netbeheerder",
-        color_discrete_map=NETBEHEERDER_KLEUREN, hover_name="postcode_eerste",
-        hover_data={"provincie": True, "aantal": True, "gem_mw": ":.2f",
-                    "max_mw": ":.2f", "gem_duur": ":.1f", "lat": False, "lon": False},
-        size_max=30, zoom=6.5, center={"lat": 52.2, "lon": 5.5},
-        title="Congestiegebieden per postcode",
-    )
-    fig.update_layout(map_style="carto-positron", height=600, margin=dict(l=0, r=0, t=40, b=0))
-    st.plotly_chart(fig, use_container_width=True)
-
-    with st.expander("Dichtheidskaart (heatmap)"):
-        fig_heat = px.density_map(
-            map_df, lat="lat", lon="lon", z="gem_vereist_mw", radius=20,
-            center={"lat": 52.2, "lon": 5.5}, zoom=6.5,
-            color_continuous_scale="YlOrRd", title="Energie-intensiteit per gebied",
-        )
-        fig_heat.update_layout(map_style="carto-positron", height=500, margin=dict(l=0, r=0, t=40, b=0))
-        st.plotly_chart(fig_heat, use_container_width=True)
-
-
-# Tab 2: Correlatie-Dashboard
-
-def render_correlatie(df, weerdata):
-    st.subheader("Weer & Congestie Correlatie")
-    if weerdata.empty:
-        st.warning("Geen weerdata beschikbaar. Controleer je internetverbinding.")
-        return
-
-    dag_counts = (
-        df.groupby(df["datum"].dt.date)
-        .agg(berichten=("id", "count"), gem_mw=("gem_vereist_mw", "mean"))
-        .reset_index()
-    )
-    dag_counts.columns = ["datum", "berichten", "gem_mw"]
-    dag_counts["datum"] = pd.to_datetime(dag_counts["datum"])
-
-    weer_dag = weerdata.copy()
-    weer_dag["datum"] = pd.to_datetime(weer_dag["datum"]).dt.normalize()
-    dag_counts["datum"] = dag_counts["datum"].dt.normalize()
-    merged = pd.merge(dag_counts, weer_dag, on="datum", how="inner")
-
-    if merged.empty:
-        st.info("Geen overlap gevonden tussen berichten-data en weerdata.")
-        return
-
-    col1, col2 = st.columns(2)
-    with col1:
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        fig.add_trace(go.Bar(x=merged["datum"], y=merged["berichten"],
-                             name="Berichten", marker_color=COLORS["secondary"], opacity=0.6), secondary_y=False)
-        fig.add_trace(go.Scatter(x=merged["datum"], y=merged["windsnelheid"],
-                                 name="Windsnelheid (m/s)", line=dict(color=COLORS["accent"], width=2)), secondary_y=True)
-        fig.update_layout(title="Berichten vs. Windsnelheid", height=400, legend=dict(orientation="h", y=-0.15))
-        fig.update_yaxes(title_text="Aantal berichten", secondary_y=False)
-        fig.update_yaxes(title_text="Wind (m/s)", secondary_y=True)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        fig2 = make_subplots(specs=[[{"secondary_y": True}]])
-        fig2.add_trace(go.Bar(x=merged["datum"], y=merged["berichten"],
-                              name="Berichten", marker_color=COLORS["secondary"], opacity=0.6), secondary_y=False)
-        fig2.add_trace(go.Scatter(x=merged["datum"], y=merged["zonneschijnduur"],
-                                  name="Zonneschijn (uur)", line=dict(color=COLORS["enexis"], width=2)), secondary_y=True)
-        fig2.update_layout(title="Berichten vs. Zonneschijnduur", height=400, legend=dict(orientation="h", y=-0.15))
-        fig2.update_yaxes(title_text="Aantal berichten", secondary_y=False)
-        fig2.update_yaxes(title_text="Zon (uur)", secondary_y=True)
-        st.plotly_chart(fig2, use_container_width=True)
-
-    st.markdown("#### Correlatie-analyse")
-    col3, col4 = st.columns(2)
-    with col3:
-        fig_s = px.scatter(merged, x="windsnelheid", y="berichten", trendline="ols",
-                           color_discrete_sequence=[COLORS["secondary"]],
-                           title="Wind -> Congestiefrequentie",
-                           labels={"windsnelheid": "Windsnelheid (m/s)", "berichten": "Berichten/dag"})
-        fig_s.update_layout(height=350)
-        st.plotly_chart(fig_s, use_container_width=True)
-        corr_wind = merged["windsnelheid"].corr(merged["berichten"])
-        if pd.notna(corr_wind):
-            st.caption(f"Pearson correlatie wind - berichten: **{corr_wind:.3f}**")
-
-    with col4:
-        fig_s2 = px.scatter(merged, x="zonneschijnduur", y="berichten", trendline="ols",
-                            color_discrete_sequence=[COLORS["enexis"]],
-                            title="Zon -> Congestiefrequentie",
-                            labels={"zonneschijnduur": "Zonneschijnduur (uur)", "berichten": "Berichten/dag"})
-        fig_s2.update_layout(height=350)
-        st.plotly_chart(fig_s2, use_container_width=True)
-        corr_zon = merged["zonneschijnduur"].corr(merged["berichten"])
-        if pd.notna(corr_zon):
-            st.caption(f"Pearson correlatie zon - berichten: **{corr_zon:.3f}**")
-
-
-# Tab 3: Provincie-vergelijker
-
-def render_provincie_vergelijker(df):
-    st.subheader("Provincie-vergelijker")
-    prov_df = df.dropna(subset=["provincie"]).copy()
-    if prov_df.empty:
-        st.warning("Geen provinciedata beschikbaar.")
-        return
-
-    col1, col2 = st.columns(2)
-    with col1:
-        prov_agg = (
-            prov_df.groupby("provincie")
-            .agg(berichten=("id", "count"), gem_mw=("gem_vereist_mw", "mean"),
-                 unieke_gebieden=("buy_orders_gebied", "nunique"))
-            .reset_index().sort_values("berichten", ascending=True)
-        )
-        fig = px.bar(prov_agg, y="provincie", x="berichten", orientation="h",
-                     color="gem_mw", color_continuous_scale="YlOrRd",
-                     title="Berichten per provincie",
-                     labels={"berichten": "Aantal", "provincie": "", "gem_mw": "Gem. MW"})
-        fig.update_layout(height=450)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        prov_nb = prov_df.groupby(["provincie", "netbeheerder"]).size().reset_index(name="aantal")
-        fig2 = px.bar(prov_nb, x="provincie", y="aantal", color="netbeheerder",
-                      color_discrete_map=NETBEHEERDER_KLEUREN,
-                      title="Netbeheerder per provincie", barmode="stack")
-        fig2.update_layout(height=450, xaxis_tickangle=-45)
-        st.plotly_chart(fig2, use_container_width=True)
-
-    st.markdown("#### Top 10 Flex-hotspots")
-    recent = prov_df.copy()
-    recent["maand_label"] = recent["datum"].dt.to_period("M").astype(str)
-    maand_keuze = st.selectbox("Selecteer maand",
-                               sorted(recent["maand_label"].unique(), reverse=True), index=0)
-    maand_df = recent[recent["maand_label"] == maand_keuze]
-
-    hotspots = (
-        maand_df.groupby("buy_orders_gebied")
-        .agg(berichten=("id", "count"), gem_mw=("gem_vereist_mw", "mean"),
-             max_mw=("max_vereist_mw", "max"), gem_duur=("duur_uur", "mean"),
-             provincie=("provincie", "first"), netbeheerder=("netbeheerder", "first"))
-        .reset_index().sort_values("berichten", ascending=False).head(10)
-    )
-    if not hotspots.empty:
-        disp = hotspots.rename(columns={
-            "buy_orders_gebied": "Gebied", "berichten": "Berichten",
-            "gem_mw": "Gem. MW", "max_mw": "Max MW", "gem_duur": "Gem. duur (u)",
-            "provincie": "Provincie", "netbeheerder": "Netbeheerder",
-        })
-        disp["Gem. MW"] = disp["Gem. MW"].round(2)
-        disp["Max MW"] = disp["Max MW"].round(2)
-        disp["Gem. duur (u)"] = disp["Gem. duur (u)"].round(1)
-        st.dataframe(disp, use_container_width=True, hide_index=True,
-                     column_config={"Berichten": st.column_config.ProgressColumn(
-                         "Berichten", min_value=0, max_value=int(disp["Berichten"].max()), format="%d")})
-    else:
-        st.info(f"Geen data voor {maand_keuze}.")
-
-    st.markdown("#### Activiteit over tijd per provincie")
-    prov_tijd = (
-        prov_df.groupby([prov_df["datum"].dt.to_period("M").astype(str), "provincie"])
-        .size().reset_index(name="berichten")
-    )
-    prov_tijd.columns = ["maand", "provincie", "berichten"]
-    fig3 = px.line(prov_tijd, x="maand", y="berichten", color="provincie",
-                   title="Maandelijkse berichten per provincie")
-    fig3.update_layout(height=400, xaxis_tickangle=-45)
-    st.plotly_chart(fig3, use_container_width=True)
-
-
-# Tab 4: Gebieds-deep-dive
-
-def render_gebiedsdeepdive(df):
-    st.subheader("Gebieds-deep-dive")
-    gebieden = sorted(df["buy_orders_gebied"].dropna().unique().tolist())
-    if not gebieden:
-        st.warning("Geen gebieden beschikbaar.")
-        return
-
-    selected = st.selectbox("Selecteer een congestiegebied", gebieden)
-    gebied_df = df[df["buy_orders_gebied"] == selected].copy()
-    if gebied_df.empty:
-        st.info("Geen data voor dit gebied.")
-        return
-
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Berichten", len(gebied_df))
-    with col2:
-        nb_mode = gebied_df["netbeheerder"].mode()
-        st.metric("Netbeheerder", nb_mode.iloc[0] if not nb_mode.empty else "-")
-    with col3:
-        avg = gebied_df["gem_vereist_mw"].mean()
-        st.metric("Gem. MW", f"{avg:.2f}" if pd.notna(avg) else "-")
-    with col4:
-        prov_mode = gebied_df["provincie"].mode()
-        prov = prov_mode.iloc[0] if not prov_mode.empty else "-"
-        st.metric("Provincie", prov)
-
-    col_left, col_right = st.columns(2)
-    with col_left:
-        tijd = (
-            gebied_df.groupby(gebied_df["datum"].dt.to_period("M").astype(str))
-            .agg(berichten=("id", "count"), gem_mw=("gem_vereist_mw", "mean"))
-            .reset_index()
-        )
-        tijd.columns = ["maand", "berichten", "gem_mw"]
-        fig = make_subplots(specs=[[{"secondary_y": True}]])
-        fig.add_trace(go.Bar(x=tijd["maand"], y=tijd["berichten"], name="Berichten",
-                             marker_color=COLORS["secondary"]), secondary_y=False)
-        fig.add_trace(go.Scatter(x=tijd["maand"], y=tijd["gem_mw"], name="Gem. MW",
-                                 line=dict(color=COLORS["accent"], width=3)), secondary_y=True)
-        fig.update_layout(title="Tijdlijn", height=350)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col_right:
-        uur_dist = gebied_df["uur_aangemaakt"].value_counts().sort_index().reset_index()
-        uur_dist.columns = ["uur", "aantal"]
-        fig2 = px.bar(uur_dist, x="uur", y="aantal", title="Verdeling over de dag",
-                      color_discrete_sequence=[COLORS["secondary"]])
-        fig2.update_layout(height=350)
-        fig2.update_xaxes(dtick=1, title="Uur van de dag")
-        st.plotly_chart(fig2, use_container_width=True)
-
-    st.markdown("#### MW-profiel analyse")
-    profielen = gebied_df["vereist_profiel_mw"].dropna()
-    if not profielen.empty:
-        last_profiles = profielen.tail(5).tolist()
-        fig_prof = go.Figure()
-        for i, prof_str in enumerate(last_profiles):
-            values = parse_mw_profile(prof_str)
-            if values:
-                fig_prof.add_trace(go.Scatter(y=values, mode="lines+markers",
-                                              name=f"Profiel {i+1}", line=dict(width=2)))
-        fig_prof.update_layout(title="Recente MW-profielen (kwartierwaarden)",
-                               xaxis_title="Kwartier", yaxis_title="MW", height=350)
-        st.plotly_chart(fig_prof, use_container_width=True)
-
-    with st.expander("Energie-intensiteit & Gebiedsinformatie"):
-        postcodes = gebied_df["postcodes"].dropna().iloc[0] if not gebied_df["postcodes"].dropna().empty else None
-        provincie = prov if prov != "-" else None
-        st.markdown(f"**Postcodes:** {postcodes or 'Onbekend'}")
-        st.markdown(f"**Provincie:** {provincie or 'Onbekend'}")
-        if provincie:
-            gem_mw = gebied_df["gem_vereist_mw"].mean()
-            if pd.notna(gem_mw) and gem_mw > 2:
-                st.info("Hoge energie-intensiteit - waarschijnlijk industrieel/agrarisch gebied met veel opwek.")
-            elif pd.notna(gem_mw) and gem_mw > 0.5:
-                st.info("Gemiddelde energie-intensiteit - gemengd woon-/industriegebied.")
-            else:
-                st.info("Lage energie-intensiteit - waarschijnlijk residentieel gebied.")
-            st.caption("Gebiedsinformatie is gebaseerd op CBS Kerncijfers Wijken en Buurten. "
-                       "Koppel de PDOK API voor nauwkeurigere terreinclassificatie.")
-
-
-# Tab 5: Overzicht & Statistieken
-
-def render_overzicht(df):
-    st.subheader("Overzicht & Trends")
-    col1, col2 = st.columns(2)
-    with col1:
-        maand = df.groupby(df["datum"].dt.to_period("M").astype(str)).size().reset_index(name="berichten")
-        maand.columns = ["maand", "berichten"]
-        fig = px.area(maand, x="maand", y="berichten", title="Berichten per maand",
-                      color_discrete_sequence=[COLORS["secondary"]])
-        fig.update_layout(height=350, xaxis_tickangle=-45)
-        st.plotly_chart(fig, use_container_width=True)
-
-    with col2:
-        nb_maand = (
-            df.groupby([df["datum"].dt.to_period("M").astype(str), "netbeheerder"])
-            .size().reset_index(name="berichten")
-        )
-        nb_maand.columns = ["maand", "netbeheerder", "berichten"]
-        fig2 = px.area(nb_maand, x="maand", y="berichten", color="netbeheerder",
-                       color_discrete_map=NETBEHEERDER_KLEUREN, title="Berichten per netbeheerder")
-        fig2.update_layout(height=350, xaxis_tickangle=-45)
-        st.plotly_chart(fig2, use_container_width=True)
-
-    col3, col4 = st.columns(2)
-    with col3:
-        type_counts = df["type"].value_counts().reset_index()
-        type_counts.columns = ["type", "aantal"]
-        fig3 = px.pie(type_counts, names="type", values="aantal", title="Verdeling berichttype",
-                      color_discrete_sequence=px.colors.qualitative.Set2, hole=0.4)
-        fig3.update_layout(height=350)
-        st.plotly_chart(fig3, use_container_width=True)
-
-    with col4:
-        verpl_maand = (
-            df.groupby([df["datum"].dt.to_period("M").astype(str), "verplichting"])
-            .size().reset_index(name="berichten")
-        )
-        verpl_maand.columns = ["maand", "verplichting", "berichten"]
-        fig4 = px.bar(verpl_maand, x="maand", y="berichten", color="verplichting",
-                      title="Vrijwillig vs. Verplicht", barmode="stack",
-                      color_discrete_sequence=[COLORS["success"], COLORS["danger"]])
-        fig4.update_layout(height=350, xaxis_tickangle=-45)
-        st.plotly_chart(fig4, use_container_width=True)
-
-    st.markdown("#### Activiteitspatronen")
-    if "uur_aangemaakt" in df.columns:
-        heatmap_data = df.groupby(["weekdag", "uur_aangemaakt"]).size().reset_index(name="berichten")
-        dag_order = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-        dag_nl = {"Monday": "Maandag", "Tuesday": "Dinsdag", "Wednesday": "Woensdag",
-                  "Thursday": "Donderdag", "Friday": "Vrijdag", "Saturday": "Zaterdag", "Sunday": "Zondag"}
-        heatmap_data["weekdag_nl"] = heatmap_data["weekdag"].map(dag_nl)
-        heatmap_data["weekdag_order"] = heatmap_data["weekdag"].apply(
-            lambda x: dag_order.index(x) if x in dag_order else 7)
-        heatmap_data = heatmap_data.sort_values("weekdag_order")
-        pivot = heatmap_data.pivot_table(index="weekdag_nl", columns="uur_aangemaakt",
-                                         values="berichten", fill_value=0)
-        nl_order = ["Maandag", "Dinsdag", "Woensdag", "Donderdag", "Vrijdag", "Zaterdag", "Zondag"]
-        pivot = pivot.reindex([d for d in nl_order if d in pivot.index])
-        fig5 = px.imshow(pivot, color_continuous_scale="YlOrRd",
-                         title="Berichten per weekdag en uur",
-                         labels=dict(x="Uur", y="Dag", color="Berichten"), aspect="auto")
-        fig5.update_layout(height=300)
-        st.plotly_chart(fig5, use_container_width=True)
-
-
-# Hoofdapplicatie
-
-def main():
-    if not Path(DB_PATH).exists() and Path(EXCEL_PATH).exists():
-        with st.spinner("Excel wordt geimporteerd naar database..."):
-            n = import_excel_to_db(EXCEL_PATH, DB_PATH)
-            st.toast(f"{n:,} berichten geimporteerd!", icon="⚡")
-
-    df = load_marktberichten()
-    if df.empty:
-        st.error("Geen data gevonden. Plaats GOPACS_Marktberichten.xlsx in dezelfde map als app.py.")
-        return
-
-    filters = render_sidebar(df)
-    filtered = apply_filters(df, filters)
-    render_kpis(filtered)
+with st.sidebar:
+    st.image("https://img.icons8.com/fluency/96/energy-saving-bulb.png", width=48)
+    st.title("Flexkaart")
+    st.caption("GOPACS Congestiemanagement Dashboard")
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Kaart", "Weer & Correlatie", "Provincies", "Gebieds-deep-dive", "Overzicht",
-    ])
+    needs_fetch = _ensure_db()
 
-    with tab1:
-        render_kaart(filtered)
-    with tab2:
-        min_d = filtered["datum"].min()
-        max_d = filtered["datum"].max()
-        start = min_d.strftime("%Y-%m-%d") if pd.notna(min_d) else "2020-01-01"
-        end = max_d.strftime("%Y-%m-%d") if pd.notna(max_d) else "2026-04-12"
-        weerdata = load_weerdata(start, end)
-        render_correlatie(filtered, weerdata)
-    with tab3:
-        render_provincie_vergelijker(filtered)
-    with tab4:
-        render_gebiedsdeepdive(filtered)
-    with tab5:
-        render_overzicht(filtered)
+    if st.button("Data vernieuwen", type="primary", use_container_width=True):
+        results = _do_fetch()
+        _also_import_excel()
+        st.cache_data.clear()
+        st.success("Data succesvol opgehaald!")
+        for src, cnt in results.items():
+            st.write(f"  {src}: {cnt}")
+        st.rerun()
+
+    if needs_fetch:
+        st.warning("Database is leeg — klik 'Data vernieuwen' om te starten.")
+        _do_fetch()
+        _also_import_excel()
+        st.cache_data.clear()
+        st.rerun()
+
+    # Fetch log
+    log_df = load_fetch_log()
+    if not log_df.empty:
+        st.divider()
+        st.subheader("Laatste sync")
+        for _, row in log_df.iterrows():
+            st.text(f"{row['source']}: {row.get('records_fetched', '?')} records")
+            if row.get("last_fetch"):
+                ts = row["last_fetch"][:16].replace("T", " ")
+                st.caption(ts)
 
 
-if __name__ == "__main__":
-    main()
+# ── Main Tabs ────────────────────────────────────────
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Flexkaart (Geodata)",
+    "Marktwaarde (Financials)",
+    "Kostenanalyse (Expenses)",
+    "Performance",
+])
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TAB 1: FLEXKAART / GEODATA
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+with tab1:
+    st.header("Flexkaart — Congestiegebieden")
+
+    ann_df = load_announcements()
+    weather_df = load_weather()
+    mkb_df = load_marktberichten()
+
+    # Probeer eerst announcements, fallback naar marktberichten
+    if not ann_df.empty:
+        # Enrich announcements met postcodes en geocoding
+        map_data = []
+        for _, row in ann_df.iterrows():
+            zips = parse_zip_codes(row.get("zip_codes", "[]"))
+            if zips:
+                first_zip = zips[0]
+                lat, lon = zip_to_coords(first_zip)
+                if lat and lon:
+                    map_data.append({
+                        "lat": lat, "lon": lon,
+                        "id": row["id"],
+                        "organisation": row.get("organisation", ""),
+                        "state": row.get("state", ""),
+                        "type": row.get("type", ""),
+                        "gem_required_mw": row.get("gem_required_mw"),
+                        "datum": row.get("datum"),
+                        "problem_area": row.get("problem_area", ""),
+                        "provincie": zip_to_province(first_zip),
+                        "postcode": first_zip,
+                    })
+        map_df = pd.DataFrame(map_data) if map_data else pd.DataFrame()
+    elif not mkb_df.empty:
+        map_df = mkb_df[mkb_df["lat"].notna() & mkb_df["lon"].notna()].copy()
+        if "gem_vereist_mw" in map_df.columns:
+            map_df.rename(columns={"gem_vereist_mw": "gem_required_mw"}, inplace=True)
+        if "netbeheerder" in map_df.columns:
+            map_df.rename(columns={"netbeheerder": "organisation"}, inplace=True)
+    else:
+        map_df = pd.DataFrame()
+
+    if not map_df.empty:
+        # KPI rij
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            total_ann = len(ann_df) if not ann_df.empty else len(mkb_df)
+            st.metric("Totaal berichten", f"{total_ann:,}")
+        with col2:
+            n_gebieden = map_df["problem_area"].nunique() if "problem_area" in map_df.columns else map_df.get("congestiegebied", pd.Series()).nunique()
+            st.metric("Congestiegebieden", n_gebieden)
+        with col3:
+            if "gem_required_mw" in map_df.columns:
+                avg_mw = map_df["gem_required_mw"].mean()
+                st.metric("Gem. vereist MW", f"{avg_mw:.1f}" if pd.notna(avg_mw) else "—")
+            else:
+                st.metric("Gem. vereist MW", "—")
+        with col4:
+            n_prov = map_df["provincie"].nunique() if "provincie" in map_df.columns else 0
+            st.metric("Provincies", n_prov)
+
+        st.divider()
+
+        # Kaart
+        col_map, col_side = st.columns([2, 1])
+
+        with col_map:
+            size_col = "gem_required_mw" if "gem_required_mw" in map_df.columns else None
+            color_col = "organisation" if "organisation" in map_df.columns else None
+            hover_data = ["datum", "state", "problem_area"] if "problem_area" in map_df.columns else []
+
+            fig_map = px.scatter_map(
+                map_df,
+                lat="lat", lon="lon",
+                size=size_col if size_col and map_df[size_col].notna().any() else None,
+                color=color_col,
+                color_discrete_map=NETBEHEERDER_COLORS if color_col else None,
+                hover_data=[c for c in hover_data if c in map_df.columns],
+                zoom=6.5,
+                center={"lat": 52.2, "lon": 5.3},
+                height=550,
+                title="Congestielocaties Nederland",
+            )
+            fig_map.update_layout(
+                map_style="carto-positron",
+                margin=dict(l=0, r=0, t=40, b=0),
+            )
+            st.plotly_chart(fig_map, use_container_width=True)
+
+        with col_side:
+            st.subheader("Per provincie")
+            if "provincie" in map_df.columns:
+                prov_counts = map_df["provincie"].value_counts().reset_index()
+                prov_counts.columns = ["Provincie", "Aantal"]
+                fig_prov = px.bar(
+                    prov_counts, x="Aantal", y="Provincie", orientation="h",
+                    color_discrete_sequence=[COLORS["secondary"]],
+                )
+                plotly_layout(fig_prov, height=350)
+                st.plotly_chart(fig_prov, use_container_width=True)
+
+            # Weer-correlatie als beschikbaar
+            if not weather_df.empty and not ann_df.empty and "datum" in ann_df.columns:
+                st.subheader("Weer-correlatie")
+                ann_per_dag = ann_df.groupby("datum").size().reset_index(name="n_berichten")
+                weer_merge = weather_df.merge(ann_per_dag, on="datum", how="inner")
+                if not weer_merge.empty and "temp_gem" in weer_merge.columns:
+                    corr = weer_merge[["temp_gem", "windsnelheid", "neerslag", "n_berichten"]].corr()
+                    st.caption("Correlatie met aantal berichten:")
+                    st.write(f"  Temperatuur: {corr.loc['temp_gem', 'n_berichten']:.2f}")
+                    st.write(f"  Wind: {corr.loc['windsnelheid', 'n_berichten']:.2f}")
+                    st.write(f"  Neerslag: {corr.loc['neerslag', 'n_berichten']:.2f}")
+
+    else:
+        st.info("Geen geodata beschikbaar. Klik op 'Data vernieuwen' in de sidebar.")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TAB 2: MARKTWAARDE / FINANCIALS
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+with tab2:
+    st.header("Marktwaarde — Gerealiseerde Transacties")
+
+    cb_df = load_cleared_buckets()
+    perf_df = load_performance()
+
+    if not cb_df.empty:
+        # Bereken MWh en prijzen
+        cb_df["total_volume_mwh"] = cb_df["buy_volume_mwh"].fillna(0) + cb_df["sell_volume_mwh"].fillna(0)
+        cb_df["datum_dt"] = pd.to_datetime(cb_df["datum"], errors="coerce")
+        cb_df["maand_label"] = cb_df["datum_dt"].dt.to_period("M").astype(str)
+
+        # KPI's
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Transacties", f"{len(cb_df):,}")
+        with col2:
+            total_buy = cb_df["buy_volume_mwh"].sum()
+            st.metric("Totaal buy volume", format_mwh(total_buy))
+        with col3:
+            total_sell = cb_df["sell_volume_mwh"].sum()
+            st.metric("Totaal sell volume", format_mwh(total_sell))
+        with col4:
+            if not perf_df.empty:
+                total_spread = perf_df["spread_eur"].sum()
+                st.metric("Totale spread", format_eur(total_spread))
+            else:
+                st.metric("Totale spread", "—")
+
+        st.divider()
+
+        # Maandelijks volume
+        col_vol, col_price = st.columns(2)
+
+        with col_vol:
+            monthly = cb_df.groupby("maand_label").agg(
+                buy=("buy_volume_mwh", "sum"),
+                sell=("sell_volume_mwh", "sum"),
+            ).reset_index()
+
+            fig_vol = go.Figure()
+            fig_vol.add_trace(go.Bar(
+                x=monthly["maand_label"], y=monthly["buy"],
+                name="Buy volume (MWh)", marker_color=COLORS["secondary"],
+            ))
+            fig_vol.add_trace(go.Bar(
+                x=monthly["maand_label"], y=monthly["sell"],
+                name="Sell volume (MWh)", marker_color=COLORS["accent"],
+            ))
+            plotly_layout(fig_vol, "Maandelijks transactievolume (MWh)", 400)
+            fig_vol.update_layout(barmode="group")
+            st.plotly_chart(fig_vol, use_container_width=True)
+
+        with col_price:
+            if not perf_df.empty:
+                perf_df["maand_label"] = perf_df.apply(
+                    lambda r: f"{int(r['year'])}-{int(r['month']):02d}", axis=1
+                )
+                perf_df["avg_buy_price"] = np.where(
+                    perf_df["buy_volume_mwh"] > 0,
+                    perf_df["buy_price_eur"] / perf_df["buy_volume_mwh"],
+                    0
+                )
+                perf_df["avg_sell_price"] = np.where(
+                    perf_df["sell_volume_mwh"] > 0,
+                    perf_df["sell_price_eur"] / perf_df["sell_volume_mwh"],
+                    0
+                )
+
+                fig_price = go.Figure()
+                fig_price.add_trace(go.Scatter(
+                    x=perf_df["maand_label"], y=perf_df["avg_buy_price"],
+                    mode="lines+markers", name="Gem. buy prijs (EUR/MWh)",
+                    line=dict(color=COLORS["secondary"], width=2),
+                ))
+                fig_price.add_trace(go.Scatter(
+                    x=perf_df["maand_label"], y=perf_df["avg_sell_price"],
+                    mode="lines+markers", name="Gem. sell prijs (EUR/MWh)",
+                    line=dict(color=COLORS["accent"], width=2),
+                ))
+                plotly_layout(fig_price, "Gemiddelde prijs per MWh", 400)
+                st.plotly_chart(fig_price, use_container_width=True)
+
+        # Volume per netbeheerder
+        st.subheader("Transacties per netbeheerder")
+        if "organisation" in cb_df.columns:
+            org_vol = cb_df.groupby("organisation").agg(
+                buy_total=("buy_volume_mwh", "sum"),
+                sell_total=("sell_volume_mwh", "sum"),
+                n_transacties=("clearing_event_id", "count"),
+            ).reset_index().sort_values("buy_total", ascending=False)
+
+            fig_org = px.bar(
+                org_vol.melt(id_vars=["organisation"], value_vars=["buy_total", "sell_total"],
+                             var_name="type", value_name="MWh"),
+                x="organisation", y="MWh", color="type", barmode="group",
+                color_discrete_map={"buy_total": COLORS["secondary"], "sell_total": COLORS["accent"]},
+                labels={"organisation": "Netbeheerder", "MWh": "Volume (MWh)"},
+            )
+            plotly_layout(fig_org, "Volume per netbeheerder", 400)
+            st.plotly_chart(fig_org, use_container_width=True)
+
+        # Spread tijdlijn
+        if not perf_df.empty:
+            st.subheader("Spread-ontwikkeling")
+            fig_spread = go.Figure()
+            fig_spread.add_trace(go.Scatter(
+                x=perf_df["maand_label"], y=perf_df["spread_eur"],
+                mode="lines+markers", name="Spread (EUR)",
+                fill="tozeroy", fillcolor="rgba(46,134,193,0.1)",
+                line=dict(color=COLORS["secondary"], width=2),
+            ))
+            plotly_layout(fig_spread, "Maandelijkse spread (EUR)", 350)
+            st.plotly_chart(fig_spread, use_container_width=True)
+
+    else:
+        st.info("Geen transactiedata beschikbaar. Klik op 'Data vernieuwen' in de sidebar.")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TAB 3: KOSTENANALYSE / EXPENSES
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+with tab3:
+    st.header("Kostenanalyse — Expenses per Netbeheerder")
+
+    exp_df = load_expenses()
+
+    if not exp_df.empty:
+        exp_df["maand_label"] = exp_df.apply(
+            lambda r: f"{int(r['year'])}-{int(r['month']):02d}", axis=1
+        )
+        exp_df["total_volume"] = exp_df["sell_volume"].fillna(0) + exp_df["buy_volume"].fillna(0)
+
+        # KPI's
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            total_spread = exp_df["spread"].sum()
+            st.metric("Totale spread", format_eur(total_spread))
+        with col2:
+            total_buy = exp_df["buy_volume"].sum()
+            st.metric("Totaal buy volume", format_mwh(total_buy))
+        with col3:
+            total_sell = exp_df["sell_volume"].sum()
+            st.metric("Totaal sell volume", format_mwh(total_sell))
+        with col4:
+            n_orgs = exp_df["organisation_name"].nunique()
+            st.metric("Netbeheerders", n_orgs)
+
+        st.divider()
+
+        # Filter per netbeheerder
+        all_orgs = sorted(exp_df["organisation_name"].unique())
+        selected_orgs = st.multiselect(
+            "Filter netbeheerders", all_orgs, default=all_orgs,
+            key="exp_org_filter"
+        )
+        filtered = exp_df[exp_df["organisation_name"].isin(selected_orgs)]
+
+        col_left, col_right = st.columns(2)
+
+        with col_left:
+            # Spread per netbeheerder (stacked bar)
+            fig_spread = px.bar(
+                filtered, x="maand_label", y="spread",
+                color="organisation_name",
+                color_discrete_map=NETBEHEERDER_COLORS,
+                labels={"maand_label": "Maand", "spread": "Spread (EUR)", "organisation_name": "Netbeheerder"},
+            )
+            plotly_layout(fig_spread, "Maandelijkse spread per netbeheerder", 450)
+            fig_spread.update_layout(barmode="stack")
+            st.plotly_chart(fig_spread, use_container_width=True)
+
+        with col_right:
+            # Volume per netbeheerder (stacked area)
+            monthly_vol = filtered.groupby(["maand_label", "organisation_name"]).agg(
+                total=("total_volume", "sum")
+            ).reset_index()
+
+            fig_area = px.area(
+                monthly_vol, x="maand_label", y="total",
+                color="organisation_name",
+                color_discrete_map=NETBEHEERDER_COLORS,
+                labels={"maand_label": "Maand", "total": "Volume (MWh)", "organisation_name": "Netbeheerder"},
+            )
+            plotly_layout(fig_area, "Cumulatief volume per netbeheerder", 450)
+            st.plotly_chart(fig_area, use_container_width=True)
+
+        # Totaal per netbeheerder (pie + bar)
+        col_pie, col_bar = st.columns(2)
+
+        with col_pie:
+            org_totals = filtered.groupby("organisation_name").agg(
+                spread_total=("spread", "sum"),
+            ).reset_index().sort_values("spread_total", ascending=False)
+
+            fig_pie = px.pie(
+                org_totals, values="spread_total", names="organisation_name",
+                color="organisation_name", color_discrete_map=NETBEHEERDER_COLORS,
+                hole=0.4,
+            )
+            plotly_layout(fig_pie, "Aandeel spread per netbeheerder", 400)
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        with col_bar:
+            org_vol = filtered.groupby("organisation_name").agg(
+                buy=("buy_volume", "sum"),
+                sell=("sell_volume", "sum"),
+            ).reset_index().sort_values("buy", ascending=False)
+
+            fig_bs = px.bar(
+                org_vol.melt(id_vars=["organisation_name"],
+                             value_vars=["buy", "sell"],
+                             var_name="Richting", value_name="MWh"),
+                x="organisation_name", y="MWh", color="Richting",
+                barmode="group",
+                color_discrete_map={"buy": COLORS["secondary"], "sell": COLORS["accent"]},
+                labels={"organisation_name": "Netbeheerder"},
+            )
+            plotly_layout(fig_bs, "Buy vs Sell volume per netbeheerder", 400)
+            st.plotly_chart(fig_bs, use_container_width=True)
+
+        # Detailtabel
+        with st.expander("Ruwe data bekijken"):
+            st.dataframe(
+                filtered[["maand_label", "organisation_name", "buy_volume", "sell_volume", "spread"]].rename(
+                    columns={
+                        "maand_label": "Maand",
+                        "organisation_name": "Netbeheerder",
+                        "buy_volume": "Buy (MWh)",
+                        "sell_volume": "Sell (MWh)",
+                        "spread": "Spread (EUR)",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    else:
+        st.info("Geen kostendata beschikbaar. Klik op 'Data vernieuwen' in de sidebar.")
+
+
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+# TAB 4: PERFORMANCE
+# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+with tab4:
+    st.header("Performance — Congestiemanagement Effectiviteit")
+
+    perf_df2 = load_performance()
+    ann_df2 = load_announcements()
+
+    if not perf_df2.empty:
+        perf_df2["maand_label"] = perf_df2.apply(
+            lambda r: f"{int(r['year'])}-{int(r['month']):02d}", axis=1
+        )
+
+        # Berekende metrics
+        perf_df2["net_volume"] = perf_df2["buy_volume_mwh"] - perf_df2["sell_volume_mwh"]
+        perf_df2["cost_efficiency"] = np.where(
+            perf_df2["buy_volume_mwh"] + perf_df2["sell_volume_mwh"] > 0,
+            perf_df2["spread_eur"] / (perf_df2["buy_volume_mwh"] + perf_df2["sell_volume_mwh"]),
+            0
+        )
+
+        # KPI's
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            cumul_spread = perf_df2["spread_eur"].sum()
+            st.metric("Cumulatieve spread", format_eur(cumul_spread))
+        with col2:
+            cumul_buy = perf_df2["buy_volume_mwh"].sum()
+            st.metric("Cumulatief buy volume", format_mwh(cumul_buy))
+        with col3:
+            avg_eff = perf_df2["cost_efficiency"].mean()
+            st.metric("Gem. kosten per MWh", f"\u20ac {avg_eff:.2f}" if pd.notna(avg_eff) else "—")
+        with col4:
+            if not ann_df2.empty:
+                success_rate = (ann_df2["state"] == "CLEARED").mean() * 100 if "state" in ann_df2.columns else 0
+                st.metric("Clearing rate", f"{success_rate:.1f}%")
+            else:
+                st.metric("Maanden actief", len(perf_df2))
+
+        st.divider()
+
+        # Jaarlijkse vergelijking
+        col_year, col_eff = st.columns(2)
+
+        with col_year:
+            yearly = perf_df2.groupby("year").agg(
+                spread=("spread_eur", "sum"),
+                buy=("buy_volume_mwh", "sum"),
+                sell=("sell_volume_mwh", "sum"),
+            ).reset_index()
+
+            fig_yearly = make_subplots(specs=[[{"secondary_y": True}]])
+            fig_yearly.add_trace(
+                go.Bar(x=yearly["year"], y=yearly["spread"], name="Spread (EUR)",
+                       marker_color=COLORS["secondary"], opacity=0.7),
+                secondary_y=False,
+            )
+            fig_yearly.add_trace(
+                go.Scatter(x=yearly["year"], y=yearly["buy"], name="Buy volume (MWh)",
+                           mode="lines+markers", line=dict(color=COLORS["accent"], width=2)),
+                secondary_y=True,
+            )
+            fig_yearly.add_trace(
+                go.Scatter(x=yearly["year"], y=yearly["sell"], name="Sell volume (MWh)",
+                           mode="lines+markers", line=dict(color=COLORS["success"], width=2, dash="dash")),
+                secondary_y=True,
+            )
+            plotly_layout(fig_yearly, "Jaarlijks overzicht", 420)
+            fig_yearly.update_yaxes(title_text="Spread (EUR)", secondary_y=False)
+            fig_yearly.update_yaxes(title_text="Volume (MWh)", secondary_y=True)
+            st.plotly_chart(fig_yearly, use_container_width=True)
+
+        with col_eff:
+            # Cost efficiency trend
+            fig_eff = go.Figure()
+            fig_eff.add_trace(go.Scatter(
+                x=perf_df2["maand_label"], y=perf_df2["cost_efficiency"],
+                mode="lines+markers", name="Kosten/MWh (EUR)",
+                fill="tozeroy", fillcolor="rgba(39,174,96,0.1)",
+                line=dict(color=COLORS["success"], width=2),
+            ))
+            # Voortschrijdend gemiddelde
+            if len(perf_df2) > 3:
+                perf_df2["eff_ma3"] = perf_df2["cost_efficiency"].rolling(3, min_periods=1).mean()
+                fig_eff.add_trace(go.Scatter(
+                    x=perf_df2["maand_label"], y=perf_df2["eff_ma3"],
+                    mode="lines", name="3-maands gem.",
+                    line=dict(color=COLORS["danger"], width=2, dash="dot"),
+                ))
+            plotly_layout(fig_eff, "Kostenefficiency (EUR/MWh)", 420)
+            st.plotly_chart(fig_eff, use_container_width=True)
+
+        # Maandelijkse trend - volume en spread
+        st.subheader("Maandelijkse trends")
+        col_t1, col_t2 = st.columns(2)
+
+        with col_t1:
+            fig_mtrend = go.Figure()
+            fig_mtrend.add_trace(go.Bar(
+                x=perf_df2["maand_label"], y=perf_df2["buy_volume_mwh"],
+                name="Buy (MWh)", marker_color=COLORS["secondary"],
+            ))
+            fig_mtrend.add_trace(go.Bar(
+                x=perf_df2["maand_label"], y=perf_df2["sell_volume_mwh"],
+                name="Sell (MWh)", marker_color=COLORS["accent"],
+            ))
+            plotly_layout(fig_mtrend, "Volume per maand", 350)
+            fig_mtrend.update_layout(barmode="group")
+            st.plotly_chart(fig_mtrend, use_container_width=True)
+
+        with col_t2:
+            fig_sprtrend = go.Figure()
+            fig_sprtrend.add_trace(go.Scatter(
+                x=perf_df2["maand_label"], y=perf_df2["spread_eur"].cumsum(),
+                mode="lines+markers", name="Cumulatieve spread",
+                fill="tozeroy", fillcolor="rgba(27,79,114,0.1)",
+                line=dict(color=COLORS["primary"], width=2),
+            ))
+            plotly_layout(fig_sprtrend, "Cumulatieve spread (EUR)", 350)
+            st.plotly_chart(fig_sprtrend, use_container_width=True)
+
+        # Announcements analyse (als beschikbaar)
+        if not ann_df2.empty and "state" in ann_df2.columns:
+            st.subheader("Marktberichten analyse")
+            col_s1, col_s2 = st.columns(2)
+
+            with col_s1:
+                state_counts = ann_df2["state"].value_counts().reset_index()
+                state_counts.columns = ["Status", "Aantal"]
+                fig_state = px.pie(
+                    state_counts, values="Aantal", names="Status",
+                    hole=0.4,
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                )
+                plotly_layout(fig_state, "Verdeling berichtstatus", 350)
+                st.plotly_chart(fig_state, use_container_width=True)
+
+            with col_s2:
+                if "datum" in ann_df2.columns:
+                    daily_count = ann_df2.groupby("datum").size().reset_index(name="n")
+                    daily_count["datum_dt"] = pd.to_datetime(daily_count["datum"])
+                    daily_count = daily_count.sort_values("datum_dt")
+
+                    fig_daily = go.Figure()
+                    fig_daily.add_trace(go.Scatter(
+                        x=daily_count["datum_dt"], y=daily_count["n"],
+                        mode="lines", name="Berichten/dag",
+                        line=dict(color=COLORS["secondary"], width=1),
+                    ))
+                    if len(daily_count) > 7:
+                        daily_count["ma7"] = daily_count["n"].rolling(7, min_periods=1).mean()
+                        fig_daily.add_trace(go.Scatter(
+                            x=daily_count["datum_dt"], y=daily_count["ma7"],
+                            mode="lines", name="7-daags gem.",
+                            line=dict(color=COLORS["danger"], width=2),
+                        ))
+                    plotly_layout(fig_daily, "Dagelijkse marktberichten", 350)
+                    st.plotly_chart(fig_daily, use_container_width=True)
+
+    else:
+        st.info("Geen performance data beschikbaar. Klik op 'Data vernieuwen' in de sidebar.")
+
+
+# ── Footer ───────────────────────────────────────────
+st.divider()
+st.caption("Flexkaart v2.0 — GOPACS Congestiemanagement Dashboard | Data: GOPACS API, Open-Meteo, PDOK/CBS")
