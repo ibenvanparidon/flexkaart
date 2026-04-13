@@ -649,10 +649,14 @@ with tab2:
                     line=dict(color=COLORS["forecast"], width=2.5, dash="dash")))
 
                 if len(hist_d) > 0:
-                    fig_fc.add_vline(x=hist_d.iloc[-1],
-                                      line_width=1.5, line_dash="dot",
-                                      line_color="rgba(127,127,127,0.45)",
-                                      annotation_text="Nu", annotation_font_size=10)
+                    try:
+                        vx = pd.Timestamp(hist_d.iloc[-1]).strftime("%Y-%m-%d")
+                        fig_fc.add_vline(x=vx,
+                                          line_width=1.5, line_dash="dot",
+                                          line_color="rgba(127,127,127,0.45)",
+                                          annotation_text="Nu", annotation_font_size=10)
+                    except Exception:
+                        pass
 
                 plotly_layout(fig_fc, f"{m_lbl} — {h_label}", 360)
                 fig_fc.update_yaxes(title_text=f"{m_lbl} ({m_unit})")
