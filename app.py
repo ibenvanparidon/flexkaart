@@ -525,7 +525,7 @@ with tab2:
         daily["ma7"] = daily["n"].rolling(7, min_periods=1).mean()
         fig_h = go.Figure()
         fig_h.add_trace(go.Bar(x=daily["datum_dt"], y=daily["n"],
-                                name="Berichten/dag", marker_color=COLORS["secondary"]+"88"))
+                                name="Berichten/dag", marker_color=COLORS["secondary"], opacity=0.55))
         fig_h.add_trace(go.Scatter(x=daily["datum_dt"], y=daily["ma7"],
                                     mode="lines", name="7-daags gem.",
                                     line=dict(color=COLORS["accent"], width=2.5)))
