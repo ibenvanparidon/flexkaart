@@ -244,13 +244,28 @@ def get_date_range(*dfs):
     for df in dfs:
         for col in ["datum", "start_time"]:
             if col in df.columns and not df.empty:
-                dates = pd.to_datetime(df[col], errors="coerce").dropna()
-                if not dates.empty:
-                    all_dates.extend([dates.min(), dates.max()])
+                try:
+                    dates = pd.to_datetime(df[col], errors="coerce").dropna()
+                    if dates.empty:
+                        continue
+                    # Pandas 3.0: strip timezone zodat min/max vergelijking altijd werkt
+                    if hasattr(dates, "dt") and getattr(dates.dt, "tz", None) is not None:
+                        dates = dates.dt.tz_localize(None)
+                    dmin, dmax = dates.min(), dates.max()
+                    if pd.notna(dmin):
+                        all_dates.append(pd.Timestamp(dmin).replace(tzinfo=None))
+                    if pd.notna(dmax):
+                        all_dates.append(pd.Timestamp(dmax).replace(tzinfo=None))
+                except Exception:
+                    continue
     if not all_dates:
         end = datetime.today()
         return (end - timedelta(days=730)).date(), end.date()
-    return min(all_dates).date(), max(all_dates).date()
+    try:
+        return min(all_dates).date(), max(all_dates).date()
+    except Exception:
+        end = datetime.today()
+        return (end - timedelta(days=730)).date(), end.date()
 
 def filter_widget(key, ann_df, exp_df, cb_df):
     """Rendert Periode / Netbeheerder / Provincie filters. Retourneert (start, end, orgs, provs)."""
